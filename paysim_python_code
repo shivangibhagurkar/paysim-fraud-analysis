@@ -1,0 +1,105 @@
+import pandas as pd
+import numpy as np
+
+df = pd.read_csv('paysim_small.csv') 
+
+# 1. Standardize column names
+df.rename(columns={
+    'oldbalanceOrg':  'oldbalance_orig',
+    'newbalanceOrig': 'newbalance_orig',
+    'oldbalanceDest': 'oldbalance_dest',
+    'newbalanceDest': 'newbalance_dest'
+}, inplace=True)
+
+# 2. Time & Eligibility Engineering
+df['hour_of_day'] = (df['step'] - 1) % 24
+df['is_offhours'] = df['hour_of_day'].isin([22, 23, 0, 1, 2, 3, 4, 5]).astype(int)
+df['is_eligible_type'] = df['type'].isin(['TRANSFER', 'CASH_OUT']).astype(int)
+
+# 3. Behavioral Signals
+df['dest_was_empty']  = (df['oldbalance_dest'] == 0).astype(int)
+df['orig_zeroed_out'] = ((df['newbalance_orig'] == 0) & (df['oldbalance_orig'] > 0)).astype(int)
+df['is_round_amount'] = ((df['amount'] % 1000 == 0) & (df['amount'] > 0)).astype(int)
+
+# Interaction Feature: Destination empty AND Origin zeroed (High Fraud Predictor)
+df['is_high_risk_combo'] = ((df['dest_was_empty'] == 1) & (df['orig_zeroed_out'] == 1)).astype(int)
+
+# 4. Calibrated Anomaly Detection
+df['log_amount'] = np.log1p(df['amount'])
+
+def tuned_iqr_flag(series):
+    # Using 1.5x IQR instead of 2.5x to ensure we don't miss CASH_OUT outliers
+    Q1, Q3 = series.quantile(0.25), series.quantile(0.75)
+    IQR = Q3 - Q1
+    return ((series > (Q3 + 1.5 * IQR))).astype(int)
+
+df['is_amount_anomaly'] = 0
+eligible_mask = df['is_eligible_type'] == 1
+df.loc[eligible_mask, 'is_amount_anomaly'] = (
+    df[eligible_mask].groupby('type')['log_amount'].transform(tuned_iqr_flag)
+)
+
+# 5. Data-Derived Weighting
+SIGNAL_COLS = [
+    'is_round_amount', 'is_offhours', 'is_amount_anomaly', 
+    'dest_was_empty', 'orig_zeroed_out', 'is_high_risk_combo'
+]
+
+eligible_df = df[df['is_eligible_type'] == 1]
+# Calculate fraud probability for each signal
+fraud_rates = {col: eligible_df[eligible_df[col] == 1]['isFraud'].mean() for col in SIGNAL_COLS}
+
+# Normalize to a 100-point scale
+total_raw_rate = sum(fraud_rates.values())
+WEIGHTS = {k: (v / total_raw_rate) * 100 for k, v in fraud_rates.items()}
+
+# 6. Apply Scoring
+df['risk_score'] = 0.0
+for col in SIGNAL_COLS:
+    df['risk_score'] += df[col] * WEIGHTS[col]
+df.loc[df['is_eligible_type'] == 0, 'risk_score'] = 0
+
+# 7. Refined Risk Tiering (Strict Monotonicity Settings)
+def assign_tier(score):
+    if score == 0:   return 'N/A'
+    if score < 10:   return 'Low'
+    if score < 40:   return 'Medium'
+    if score < 75:   return 'High'
+    return 'Critical'
+
+df['risk_tier'] = df['risk_score'].apply(assign_tier)
+
+# 8. Final Performance Validation
+tier_val = df[df['is_eligible_type']==1].groupby('risk_tier').agg(
+    tx_count=('isFraud', 'count'),
+    fraud_count=('isFraud', 'sum'),
+    fraud_rate=('isFraud', 'mean')
+).reindex(['Low', 'Medium', 'High', 'Critical'])
+
+print("--- FINAL PERFORMANCE VALIDATION ---")
+print(tier_val)
+
+# Automated Monotonicity Check
+rates = tier_val['fraud_rate'].tolist()
+is_monotonic = all(x <= y for x, y in zip(rates, rates[1:]))
+print(f"\nStrict Monotonicity: {'✅ PASS' if is_monotonic else '❌ FAIL'}")
+
+# 9. Export for MySQL
+export_cols = [
+    'step', 'type', 'amount', 'nameOrig', 'nameDest', 'isFraud', 
+    'risk_score', 'risk_tier', 'is_offhours', 'is_amount_anomaly', 
+    'is_high_risk_combo', 'is_round_amount'
+]
+df[export_cols].to_csv('paysim_enriched_final.csv', index=False)
+print("\nExport complete: paysim_enriched_final.csv")
+
+# main enriched table columns
+cols_export = ['step', 'type', 'amount', 'nameOrig', 'oldbalance_orig',
+       'newbalance_orig', 'nameDest', 'oldbalance_dest', 'newbalance_dest',
+       'isFraud', 'isFlaggedFraud', 'hour_of_day', 'is_offhours',
+       'is_eligible_type', 'dest_was_empty', 'orig_zeroed_out',
+       'is_round_amount', 'is_high_risk_combo', 'log_amount',
+       'is_amount_anomaly', 'risk_score', 'risk_tier']
+df[cols_export].to_csv('paysim_enriched2.csv', index=False)
+print("Exported:")
+
