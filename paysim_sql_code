@@ -1,0 +1,112 @@
+sql code:  
+create database paysim_fraud;
+use paysim_fraud;
+
+select * from paysim_fraud;
+
+-- Q1 : UPDATED SYSTEM FAILURE ANALYSIS
+
+SELECT
+    detection_method,
+    flags_raised,
+    true_positives,
+    ROUND(true_positives / flags_raised * 100, 2)             AS precision_pct,
+    ROUND(true_positives / (SELECT SUM(isFraud) FROM paysim_fraud) * 100, 2)
+                                                               AS recall_pct
+FROM (
+    -- Existing system
+    SELECT
+        'Existing: isFlaggedFraud'                AS detection_method,
+        SUM(isFlaggedFraud)                     AS flags_raised,
+        SUM(isFlaggedFraud & isFraud)          AS true_positives
+    FROM paysim_fraud
+
+    UNION ALL
+
+    -- Our model: Critical tier (Score >= 75)
+    SELECT
+        'Our Model: Critical Tier (Score 75+)',
+        COUNT(*),
+        SUM(isFraud)
+    FROM paysim_fraud
+    WHERE risk_tier = 'Critical'
+
+    UNION ALL
+
+    -- Our model: High + Critical combined (Score >= 40)
+    SELECT
+        'Our Model: High + Critical Tiers (Score 40+)',
+        COUNT(*),
+        SUM(isFraud)
+    FROM paysim_fraud
+    WHERE risk_tier IN ('Critical', 'High')
+
+) comparison_table
+ORDER BY recall_pct DESC;
+
+-- =============================================================================
+-- Q5 : FEATURE SIGNAL STRENGTH (Including Interaction Effect)
+--  'is_high_risk_combo' has a significantly higher fraud rate than the individual features.
+
+SELECT
+    signal_name,
+    signal_value,
+    txn_count,
+    fraud_count,
+    ROUND(fraud_count / txn_count * 100, 2)                    AS fraud_rate_pct
+FROM (
+    SELECT 'is_round_amount'   AS signal_name, is_round_amount   AS signal_value, COUNT(*) AS txn_count, SUM(isFraud) AS fraud_count FROM paysim_fraud WHERE is_eligible_type = 1 GROUP BY is_round_amount
+    UNION ALL
+    SELECT 'is_offhours',       is_offhours,       COUNT(*), SUM(isFraud) FROM paysim_fraud WHERE is_eligible_type = 1 GROUP BY is_offhours
+    UNION ALL
+    SELECT 'is_amount_anomaly', is_amount_anomaly, COUNT(*), SUM(isFraud) FROM paysim_fraud WHERE is_eligible_type = 1 GROUP BY is_amount_anomaly
+    UNION ALL
+    SELECT 'dest_was_empty',    dest_was_empty,    COUNT(*), SUM(isFraud) FROM paysim_fraud WHERE is_eligible_type = 1 GROUP BY dest_was_empty
+    UNION ALL
+    SELECT 'orig_zeroed_out',   orig_zeroed_out,   COUNT(*), SUM(isFraud) FROM paysim_fraud WHERE is_eligible_type = 1 GROUP BY orig_zeroed_out
+    UNION ALL
+    SELECT 'is_high_risk_combo', is_high_risk_combo, COUNT(*), SUM(isFraud) FROM paysim_fraud WHERE is_eligible_type = 1 GROUP BY is_high_risk_combo
+) signal_table
+ORDER BY signal_name, signal_value;
+
+-- =============================================================================
+-- Q6 : RISK TIER VALIDATION (Strict Monotonicity Check)
+-- fraud probability increases strictly with the tier.
+
+SELECT
+    risk_tier,
+    COUNT(*)                                                    AS txn_count,
+    SUM(isFraud)                                               AS fraud_count,
+    ROUND(SUM(isFraud) / COUNT(*) * 100, 2)                    AS fraud_rate_pct,
+    ROUND(AVG(risk_score), 2)                                   AS avg_risk_score,
+    CASE 
+        WHEN risk_tier = 'Critical' THEN 'Immediate Block'
+        WHEN risk_tier = 'High'     THEN 'Priority Review'
+        WHEN risk_tier = 'Medium'   THEN 'Standard Monitor'
+        ELSE                             'Low Risk'
+    END                                                         AS recommended_action
+FROM paysim_fraud
+WHERE is_eligible_type = 1
+GROUP BY risk_tier
+ORDER BY FIELD(risk_tier, 'Critical', 'High', 'Medium', 'Low');
+
+-- =============================================================================
+-- Q9 : TOP 50 HIGH-RISK TRANSACTIONS (Actionable Table)
+-- =============================================================================
+
+SELECT
+    nameOrig,
+    nameDest,
+    type,
+    hour_of_day,
+    FORMAT(amount, 0)                                           AS amount_formatted,
+    is_high_risk_combo,
+    is_round_amount,
+    is_amount_anomaly,
+    ROUND(risk_score, 2)                                        AS final_risk_score,
+    risk_tier,
+    CASE WHEN isFraud = 1 THEN '✅ Fraud' ELSE '❌ Legitimate' END AS ground_truth
+FROM paysim_fraud
+WHERE risk_tier IN ('Critical', 'High')
+ORDER BY risk_score DESC, amount DESC
+LIMIT 50;
